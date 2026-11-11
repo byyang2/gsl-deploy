@@ -1,0 +1,186 @@
+# byyang2/gsl-deploy/.github/workflows/deploy-to-aks.yml
+#
+# The ONLY workflow that can obtain an Azure token for the deployment identity.
+# The managed identity's single federated credential trusts exactly this file on
+# the main branch of this repo, for repos owned by this GitHub org. App repos call
+# it; they never hold cluster, registry, or identity details.
+#
+# Change control: anyone who can merge to main here can change what every app
+# deploys. Protect main with a ruleset (pull request + CODEOWNERS review).
+
+name: deploy-to-aks
+
+on:
+  workflow_call:
+    inputs:
+      build_context:
+        description: Folder passed to docker build
+        type: string
+        default: .
+      dockerfile:
+        description: Path to the Dockerfile
+        type: string
+        default: ./Dockerfile
+      manifests:
+        description: Folder of Kubernetes manifests (use __IMAGE__ and __APP__ placeholders)
+        type: string
+        default: ./manifests
+      runner:
+        description: Runner label (use a self-hosted runner label if the cluster or registry is private)
+        type: string
+        default: ubuntu-24.04
+
+env:
+  # Not secrets. Filled in by New-GslDeployIdentity.ps1 -RenderKitTo.
+  AZURE_CLIENT_ID: "d5f009a7-0bf2-45f6-b925-dff88232316d"
+  AZURE_TENANT_ID: "3eedd6fa-6320-412f-a21c-ed95babab9c0"
+  AZURE_SUBSCRIPTION_ID: "71f85e28-79ff-4a99-8f43-dbc45588d229"
+  GITHUB_ORG: "byyang2"
+  ACR_NAME: "acrgsllab71f85e28"
+  AKS_RG: "rg-gsl-poc-lab"
+  AKS_NAME: "aks-gsl-poc-lab"
+  # Approval gate. A repo (by name, in this org) must be listed here to deploy.
+  # Onboarding an app = one pull request that adds its name below.
+  ALLOWED_APPS: |
+    hello-web
+    forecast-api
+    obs-ingest
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runner }}
+    environment: development        # resolved in the CALLING repo; add required reviewers there
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve app name and check the allowlist
+        id: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          if [ "$OWNER" != "$GITHUB_ORG" ]; then
+            echo "::error::Caller $GITHUB_REPOSITORY is not in $GITHUB_ORG"; exit 1
+          fi
+          APP=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' | cut -c1-63)
+          if ! printf '%s\n' "$ALLOWED_APPS" | tr '[:upper:]' '[:lower:]' | sed 's/[[:space:]]//g' | grep -qx -- "$APP"; then
+            echo "::error::$REPO is not in ALLOWED_APPS of the central deploy workflow. Onboard it first (Add-GslApp.ps1 + PR)."; exit 1
+          fi
+          echo "name=$APP" >> "$GITHUB_OUTPUT"
+          echo "Caller: $GITHUB_REPOSITORY  ->  namespace: $APP"
+
+      - name: Check out the calling repo
+        uses: actions/checkout@v5
+
+      - name: Azure sign-in (OIDC, managed identity, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push image to ACR
+        id: image
+        shell: bash
+        env:
+          APP: ${{ steps.app.outputs.name }}
+          CONTEXT: ${{ inputs.build_context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          LOGIN_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
+          az acr login --name "$ACR_NAME"
+          IMAGE="$LOGIN_SERVER/$APP:$GITHUB_SHA"
+          docker build --file "$DOCKERFILE" --tag "$IMAGE" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" "$CONTEXT"
+          docker push "$IMAGE"
+          echo "ref=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Get cluster credentials (user, not admin; Entra via kubelogin)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v kubectl >/dev/null || ! command -v kubelogin >/dev/null; then
+            echo "Installing kubectl and kubelogin"
+            sudo az aks install-cli --only-show-errors >/dev/null
+          fi
+          if ! az aks get-credentials --resource-group "$AKS_RG" --name "$AKS_NAME" --overwrite-existing --only-show-errors; then
+            echo "::error::az aks get-credentials failed for $AKS_RG/$AKS_NAME. The deployment identity needs 'Azure Kubernetes Service Cluster User Role' on the cluster."
+            exit 1
+          fi
+          kubelogin convert-kubeconfig -l azurecli
+          if ! kubectl version --request-timeout=30s >/dev/null 2>"$RUNNER_TEMP/kv.err"; then
+            echo "::error::Cannot reach the AKS API server: $(tr '\n' ' ' < "$RUNNER_TEMP/kv.err" | cut -c1-400)"
+            exit 1
+          fi
+          echo "Connected to $AKS_NAME"
+
+      - name: Confirm this app may deploy to its namespace
+        shell: bash
+        env:
+          APP: ${{ steps.app.outputs.name }}
+        run: |
+          set -uo pipefail
+          # Azure RBAC for Kubernetes can take a few minutes to apply after onboarding; retry for up to 5 minutes.
+          for i in $(seq 1 10); do
+            if [ "$(kubectl auth can-i create deployments.apps -n "$APP" 2>/dev/null)" = "yes" ]; then
+              echo "Write access to namespace '$APP' confirmed."; exit 0
+            fi
+            echo "No write access to '$APP' yet (attempt $i/10); waiting 30s..."; sleep 30
+          done
+          echo "::error::The deployment identity has no write access to namespace '$APP'. Run Add-GslApp.ps1 for this repo."
+          exit 1
+
+      - name: Render and apply manifests
+        shell: bash
+        env:
+          APP: ${{ steps.app.outputs.name }}
+          IMAGE: ${{ steps.image.outputs.ref }}
+          MANIFESTS: ${{ inputs.manifests }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/rendered"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          cp -R "$MANIFESTS"/. "$OUT"/
+          find "$OUT" -type f \( -name '*.yaml' -o -name '*.yml' \) -print0 |
+            xargs -0 sed -i -e "s#__IMAGE__#${IMAGE}#g" -e "s#__APP__#${APP}#g"
+          if ! kubectl apply --namespace "$APP" --recursive --filename "$OUT" 2>"$RUNNER_TEMP/apply.err"; then
+            cat "$RUNNER_TEMP/apply.err"
+            echo "::error::kubectl apply failed in namespace $APP: $(grep -m1 -iE 'error|forbidden|denied' "$RUNNER_TEMP/apply.err" | cut -c1-400)"
+            echo "What this identity may do in $APP:"; kubectl auth can-i --list --namespace "$APP" | head -40 || true
+            exit 1
+          fi
+          for d in $(kubectl get deployments --namespace "$APP" -o name); do
+            if ! kubectl rollout status "$d" --namespace "$APP" --timeout=300s; then
+              kubectl describe "$d" --namespace "$APP" | tail -20 || true
+              kubectl get pods --namespace "$APP" -o wide || true
+              echo "::error::Rollout of $d in $APP did not complete (see pod status above; ImagePullBackOff = registry pull, CrashLoopBackOff = app)"
+              exit 1
+            fi
+          done
+          kubectl get deployments,pods,services --namespace "$APP" -o wide
+
+      - name: Deployment summary
+        if: always()
+        shell: bash
+        env:
+          APP: ${{ steps.app.outputs.name }}
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          {
+            echo "### Deployment: ${GITHUB_REPOSITORY}"
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Namespace | \`${APP}\` |"
+            echo "| Image | \`${IMAGE:-not built}\` |"
+            echo "| Cluster | ${AKS_RG}/${AKS_NAME} |"
+            echo "| Deployment identity (client ID) | \`${AZURE_CLIENT_ID}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Run | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} |"
+          } >> "$GITHUB_STEP_SUMMARY"
