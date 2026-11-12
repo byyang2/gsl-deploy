@@ -45,6 +45,7 @@ env:
     hello-web
     forecast-api
     obs-ingest
+    station-map
 
 jobs:
   deploy:
