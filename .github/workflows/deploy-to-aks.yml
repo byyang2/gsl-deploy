@@ -46,6 +46,7 @@ env:
     forecast-api
     obs-ingest
     station-map
+    nginx-local-demo
 
 jobs:
   deploy:
